@@ -6,82 +6,84 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Configuration Supabase (Utilise la SERVICE_ROLE_KEY pour le backend car il doit tout voir)
+# Configuration Supabase
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") 
 db: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 app = FastAPI()
 
-# --- MODÈLES DE DONNÉES ---
-class ToolCall(BaseModel):
-    # Structure simplifiée pour l'exemple
-    function: dict
-
 # --- ROUTE 1 : INITIALISATION DE L'APPEL ---
 @app.post("/call/init")
 async def init_call(request: Request):
     payload = await request.json()
-    
-    # Vapi envoie les détails de l'appel. On récupère le numéro appelé (Celui du Resto)
-    # Note: La structure du payload Vapi peut varier, il faut vérifier la doc 'Assistant Request'
-    try:
-        # Si Vapi appelle via SIP ou Twilio directement
-        called_number = payload.get('message', {}).get('phone_number', {}).get('number')
-        if not called_number:
-             # Fallback pour tests
-             called_number = payload.get('phone_number') 
-    except:
-        raise HTTPException(status_code=400, detail="Numéro introuvable")
+    print("📥 Payload Init reçu:", payload) # Pour tes logs Railway
 
-    # 1. Identifier le restaurant
+    # 1. Récupération du numéro appelé
+    try:
+        # Chemin standard Vapi
+        called_number = payload.get('message', {}).get('phone_number', {}).get('number')
+    except:
+        called_number = None
+
+    # --- 🚨 DÉBUT ASTUCE TEST WEB ---
+    # Si on ne trouve pas de numéro (test depuis le navigateur), on force le numéro US
+    if not called_number:
+        print("⚠️ Appel Web détecté : On simule le numéro de Luigi !")
+        called_number = '+12406509923' 
+    # --- 🚨 FIN ASTUCE ---
+
+    # 2. Identifier le restaurant dans Supabase
     response = db.table('restaurants').select("*").eq('twilio_phone_number', called_number).execute()
+    
     if not response.data:
-        # Fallback si le numéro n'est pas reconnu (évite que l'IA plante)
+        print(f"❌ Erreur : Aucun restaurant trouvé pour le numéro {called_number}")
         return {
-            "role": "system",
-            "content": "Tu es un assistant, mais je ne trouve pas le restaurant associé à ce numéro."
+            "assistant": {
+                "firstMessage": "Désolé, je ne trouve pas le restaurant associé à ce numéro.",
+                "model": {"provider": "openai", "model": "gpt-4o", "messages": []}
+            }
         }
     
     resto = response.data[0]
+    print(f"✅ Restaurant trouvé : {resto['name']}")
 
-    # 2. Récupérer le menu ACTIF (Le Kill Switch est ici)
+    # 3. Récupérer le menu ACTIF
     menu_resp = db.table('menu_items').select("*").eq('restaurant_id', resto['id']).eq('is_available', True).execute()
     menu_text = "\n".join([f"- {m['name']} ({m['price']}€)" for m in menu_resp.data])
 
-    # 3. Construire le Prompt Système
+    # 4. Construire le Prompt Système
     system_instruction = f"""
     Tu es l'assistant vocal du restaurant {resto['name']}.
     Ton rôle est de prendre des réservations et répondre aux questions sur le menu.
     
     MENU ACTUEL DU JOUR :
     {menu_text}
-    IMPORTANT : Si un client demande un plat qui n'est pas dans cette liste ci-dessus, dis poliment qu'il est en rupture de stock aujourd'hui.
+    IMPORTANT : Si un client demande un plat qui n'est pas dans cette liste, dis poliment qu'il est en rupture.
     
-    Règles de conversation :
-    - Sois chaleureux, bref et professionnel.
-    - Demande toujours : Nom, Nombre de personnes, Date et Heure.
-    - Une fois les infos obtenues, utilise l'outil 'book_table' pour enregistrer.
+    Règles :
+    - Sois chaleureux et bref.
+    - Demande toujours : Nom, Nombre de personnes, et Heure souhaitée.
+    - Une fois les infos obtenues, utilise l'outil 'book_table'.
     """
 
-    # On retourne la configuration à Vapi
+    # 5. Retourner la config à Vapi
     return {
         "assistant": {
             "model": {
                 "provider": "openai",
                 "model": "gpt-4o",
                 "systemPrompt": system_instruction,
-                # On définit l'outil ici pour que Vapi sache qu'il existe
                 "functions": [
                     {
                         "name": "book_table",
-                        "description": "Enregistrer une réservation quand toutes les infos sont là.",
+                        "description": "Enregistrer une réservation.",
                         "parameters": {
                             "type": "object",
                             "properties": {
                                 "customer_name": {"type": "string"},
                                 "party_size": {"type": "integer"},
-                                "reservation_datetime": {"type": "string", "description": "Format ISO ou explicite ex: 12 Janvier 20h00"}
+                                "reservation_datetime": {"type": "string"}
                             },
                             "required": ["customer_name", "party_size", "reservation_datetime"]
                         }
@@ -95,36 +97,40 @@ async def init_call(request: Request):
 @app.post("/tools/book_table")
 async def book_table(request: Request):
     payload = await request.json()
-    
-    # Extraction des arguments envoyés par GPT-4o
+    print("📥 Payload Outil reçu:", payload)
+
+    # Extraction des arguments de GPT
     args = payload.get('message', {}).get('functionCall', {}).get('parameters', {})
     
-    # Pour simplifier, on doit retrouver l'ID du resto. 
-    # Vapi envoie le contexte de l'appel, on réutilise le numéro appelé ou on passe l'ID dans le contexte.
-    # Ici, supposons qu'on refasse la recherche par numéro appelé présent dans le payload global.
+    # On doit retrouver le restaurant.
+    # Dans un outil, Vapi renvoie aussi le contexte de l'appel.
     call_data = payload.get('message', {}).get('call', {})
-    called_number = call_data.get('phone_number', {}).get('number') # À adapter selon payload réel Vapi
+    called_number = call_data.get('phone_number', {}).get('number')
+
+    # --- 🚨 DÉBUT ASTUCE TEST WEB (Aussi pour l'outil) ---
+    if not called_number:
+        called_number = '+12406509923'
+    # --- 🚨 FIN ASTUCE ---
     
-    # Recherche ID Resto (Optimisation possible: cacher l'ID dans les metadata de l'appel)
+    # Recherche ID Resto
     resto_resp = db.table('restaurants').select("id").eq('twilio_phone_number', called_number).execute()
     if not resto_resp.data:
         return {"result": "Erreur technique: Restaurant introuvable."}
     
     restaurant_id = resto_resp.data[0]['id']
 
-    # Insertion en BDD Supabase
+    # Insertion dans Supabase
     try:
         db.table('reservations').insert({
             "restaurant_id": restaurant_id,
             "customer_name": args.get('customer_name'),
             "party_size": args.get('party_size'),
-            "reservation_time": args.get('reservation_datetime'), # Note: GPT envoie des strings, il faudra peut-être parser en datetime
-            "customer_phone": call_data.get('customer', {}).get('number'), # Le numéro de l'appelant
+            "reservation_time": args.get('reservation_datetime'), 
+            "customer_phone": call_data.get('customer', {}).get('number', 'WebUser'), # Numéro client ou "WebUser"
             "status": "confirmed"
         }).execute()
         
-        # Ici : Ajouter appel API Firebase/OneSignal pour la notif push
-        
-        return {"result": "La réservation est confirmée et enregistrée."}
+        return {"result": "Réservation confirmée avec succès !"}
     except Exception as e:
-        return {"result": f"Erreur lors de l'enregistrement: {str(e)}"}
+        print(f"❌ Erreur BDD : {str(e)}")
+        return {"result": "J'ai eu un problème pour noter la réservation."}
