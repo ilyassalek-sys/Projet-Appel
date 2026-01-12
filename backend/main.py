@@ -13,6 +13,10 @@ app = FastAPI()
 
 paris_tz = pytz.timezone("Europe/Paris")
 
+@app.get("/")
+def home():
+    return {"status": "online"}
+
 # --- OUTIL 1 : CRÉATION ---
 @app.post("/tools/book_table")
 async def book_table(request: Request):
@@ -49,7 +53,7 @@ async def book_table(request: Request):
     except Exception as e:
         return {"result": f"Erreur : {str(e)}"}
 
-# --- OUTIL 2 : MODIFICATION / ANNULATION ---
+# --- OUTIL 2 : MODIFICATION / ANNULATION (VERSION ROBUSTE) ---
 @app.post("/tools/manage_reservation")
 async def manage_reservation(request: Request):
     try:
@@ -61,7 +65,7 @@ async def manage_reservation(request: Request):
         action = args.get('action') # 'cancel' ou 'update'
         new_size = args.get('new_size')
 
-        # 1. Recherche de la réservation
+        # 1. Recherche de la réservation active
         query = db.table('reservations').select("*").ilike('customer_name', f"%{name}%").eq('status', 'confirmed')
         
         if phone:
@@ -69,25 +73,29 @@ async def manage_reservation(request: Request):
             
         res = query.execute()
 
-        # 2. Gestion des doublons ou absence
+        # 2. Gestion des cas particuliers
         if len(res.data) == 0:
-            return {"result": f"Je ne trouve aucune réservation au nom de {name}."}
+            return {"result": f"Je ne trouve aucune réservation confirmée au nom de {name}."}
         
         if len(res.data) > 1 and not phone:
-            return {"result": f"Il y a plusieurs réservations au nom de {name}. Pouvez-vous me donner votre numéro de téléphone ou la date exacte pour que je puisse identifier la bonne ?"}
+            return {"result": f"Il y a plusieurs réservations pour {name}. J'ai besoin du numéro de téléphone pour identifier la bonne."}
 
         reservation_id = res.data[0]['id']
 
-        # 3. Actions
+        # 3. Actions réelles sur la base
         if action == "cancel":
             db.table('reservations').update({"status": "cancelled"}).eq('id', reservation_id).execute()
-            return {"result": f"La réservation au nom de {name} a bien été annulée."}
+            return {"result": f"C'est fait, la réservation de {name} est annulée."}
         
-        if action == "update" and new_size:
-            db.table('reservations').update({"party_size": int(new_size)}).eq('id', reservation_id).execute()
-            return {"result": f"C'est modifié ! Vous êtes maintenant {new_size} personnes pour la réservation de {name}."}
+        if action == "update":
+            if new_size:
+                # Mise à jour de party_size dans Supabase
+                db.table('reservations').update({"party_size": int(new_size)}).eq('id', reservation_id).execute()
+                return {"result": f"C'est modifié ! La réservation de {name} est passée à {new_size} personnes."}
+            else:
+                return {"result": "D'accord, quel est le nouveau nombre de personnes ?"}
 
-        return {"result": "Quelle modification souhaitez-vous faire ?"}
+        return {"result": f"J'ai bien trouvé la réservation de {name}. Voulez-vous la modifier (nombre de personnes) ou l'annuler ?"}
 
     except Exception as e:
         return {"result": f"Erreur technique : {str(e)}"}
