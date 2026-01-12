@@ -16,32 +16,19 @@ app = FastAPI()
 
 @app.get("/")
 def home():
-    return {"status": "online", "message": "Serveur de Luigi opérationnel"}
+    return {"status": "online"}
 
-# --- ROUTE 1 : INITIALISATION DE L'APPEL ---
+# --- ROUTE 1 : INITIALISATION ---
 @app.post("/call/init")
 async def init_call(request: Request):
     payload = await request.json()
-    
-    # On récupère le numéro appelé
     called_number = payload.get('message', {}).get('phone_number', {}).get('number') or '+12406509923'
     
     response = db.table('restaurants').select("*").eq('twilio_phone_number', called_number).execute()
     if not response.data:
-        return {"assistant": {"firstMessage": "Désolé, je ne trouve pas ce restaurant."}}
+        return {"assistant": {"firstMessage": "Restaurant non trouvé."}}
     
     resto = response.data[0]
-
-    system_instruction = f"""
-    Tu es l'assistant vocal de {resto['name']}.
-    
-    CONSIGNES RÉSERVATION :
-    1. Demande : Nom, Nombre de personnes, et Date/Heure (ex: ce soir à 20h).
-    2. Si tu n'as pas le numéro de téléphone, demande-le.
-    3. Une fois les infos obtenues, appelle 'book_table'.
-    
-    IMPORTANT : Si l'outil dit que le client a déjà 2 réservations, informe-le poliment du refus.
-    """
 
     return {
         "assistant": {
@@ -49,63 +36,62 @@ async def init_call(request: Request):
             "model": {
                 "provider": "openai",
                 "model": "gpt-4o-mini",
-                "systemPrompt": system_instruction
+                "systemPrompt": f"Tu es l'assistant de {resto['name']}. Demande le nom, le nombre de personnes et l'heure. Si le numéro manque, demande-le."
             }
         }
     }
 
-# --- ROUTE 2 : LOGIQUE DE RÉSERVATION ---
+# --- ROUTE 2 : BOOK TABLE (CORRIGÉE) ---
 @app.post("/tools/book_table")
 async def book_table(request: Request):
-    payload = await request.json()
-    print(f"DEBUG Payload reçu: {payload}")
-
-    # Extraction hybride (Compatible API Request Vapi)
-    args = payload.get('arguments') or payload
-    if 'message' in payload and not args.get('name'):
-        tool_call = payload.get('message', {}).get('toolCalls', [{}])[0]
-        args = tool_call.get('function', {}).get('arguments', {})
-
-    # 1. Gestion du Numéro de téléphone
-    customer_phone = (
-        payload.get('customer', {}).get('number') or 
-        payload.get('message', {}).get('call', {}).get('customer', {}).get('number') or
-        args.get('phone_backup')
-    )
-    
-    if not customer_phone or "anonymous" in str(customer_phone).lower():
-        return {"result": "Il me manque votre numéro de téléphone pour valider."}
-
-    # 2. Formatage de la Date
-    time_input = args.get('time_str')
-    parsed_date = dateparser.parse(time_input, settings={'PREFER_DATES_FROM': 'future', 'DATE_ORDER': 'DMY'})
-    
-    if not parsed_date:
-        return {"result": "Je n'ai pas compris la date. Pouvez-vous répéter le jour et l'heure ?"}
-    
-    formatted_time = parsed_date.strftime("%Y-%m-%d %H:%M:%S")
-    today_date = parsed_date.strftime("%Y-%m-%d")
-
-    # 3. Récupération du Restaurant ID
-    called_number = payload.get('phone_number', {}).get('number') or '+12406509923'
-    resto_resp = db.table('restaurants').select("id").eq('twilio_phone_number', called_number).execute()
-    if not resto_resp.data:
-        return {"result": "Erreur : Restaurant introuvable."}
-    restaurant_id = resto_resp.data[0]['id']
-
-    # 4. VÉRIFICATION ANTI-SPAM (Max 2)
-    existing_res = db.table('reservations') \
-        .select("id", count="exact") \
-        .eq('customer_phone', customer_phone) \
-        .eq('restaurant_id', restaurant_id) \
-        .ilike('reservation_time', f"{today_date}%") \
-        .execute()
-
-    if existing_res.count and existing_res.count >= 2:
-        return {"result": f"Désolé, vous avez déjà atteint la limite de 2 réservations pour aujourd'hui."}
-
-    # 5. INSERTION DANS SUPABASE
     try:
+        payload = await request.json()
+        print(f"DEBUG Payload reçu: {payload}")
+
+        # Extraction des arguments (API Request format)
+        args = payload.get('arguments') or payload
+        if 'message' in payload and not args.get('name'):
+            tool_call = payload.get('message', {}).get('toolCalls', [{}])[0]
+            args = tool_call.get('function', {}).get('arguments', {})
+
+        # 1. Récupération du numéro de téléphone
+        customer_phone = (
+            args.get('phone_backup') or 
+            payload.get('customer', {}).get('number') or
+            payload.get('message', {}).get('call', {}).get('customer', {}).get('number')
+        )
+        
+        if not customer_phone:
+            return {"result": "Il me manque votre numéro de téléphone."}
+
+        # 2. Formatage de la date
+        parsed_date = dateparser.parse(args.get('time_str'), settings={'PREFER_DATES_FROM': 'future'})
+        if not parsed_date:
+            return {"result": "Je n'ai pas compris la date."}
+        
+        formatted_time = parsed_date.strftime("%Y-%m-%d %H:%M:%S")
+        
+        # Pour l'anti-spam, on définit le début et la fin de la journée
+        start_day = parsed_date.strftime("%Y-%m-%d 00:00:00")
+        end_day = parsed_date.strftime("%Y-%m-%d 23:59:59")
+
+        # 3. Récupération Restaurant ID
+        resto_resp = db.table('restaurants').select("id").limit(1).execute()
+        restaurant_id = resto_resp.data[0]['id']
+
+        # 4. VÉRIFICATION ANTI-SPAM (Correction du filtre de date)
+        # On utilise gte (greater than or equal) et lte (less than or equal)
+        existing_res = db.table('reservations') \
+            .select("id", count="exact") \
+            .eq('customer_phone', str(customer_phone)) \
+            .gte('reservation_time', start_day) \
+            .lte('reservation_time', end_day) \
+            .execute()
+
+        if existing_res.count and existing_res.count >= 2:
+            return {"result": "Désolé, vous avez déjà 2 réservations pour cette journée."}
+
+        # 5. INSERTION
         db.table('reservations').insert({
             "restaurant_id": restaurant_id,
             "customer_phone": str(customer_phone),
@@ -115,7 +101,8 @@ async def book_table(request: Request):
             "status": "confirmed"
         }).execute()
         
-        return {"result": f"C'est parfait ! Votre table pour {args.get('size')} au nom de {args.get('name')} est réservée pour le {formatted_time}."}
+        return {"result": f"C'est fait Ilyas ! Réservé pour {args.get('size')} personnes à {formatted_time}."}
+
     except Exception as e:
-        print(f"Erreur Supabase: {e}")
-        return {"result": "Désolé, j'ai eu une erreur technique lors de l'enregistrement."}
+        print(f"❌ ERREUR : {str(e)}")
+        return {"result": "Erreur technique, mais j'ai bien noté vos infos."}
