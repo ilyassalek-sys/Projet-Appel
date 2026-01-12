@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <title>Debug Luigi</title>
+    <style>
+        body { font-family: sans-serif; padding: 20px; background: #121212; color: white; }
+        #debug-box { background: #000; color: #0f0; padding: 15px; border: 1px solid #333; height: 200px; overflow-y: scroll; text-align: left; font-family: monospace; }
+        button { padding: 10px; margin: 10px; cursor: pointer; }
+    </style>
+</head>
+<body>
+    <h1>🛠️ Mode Debug Luigi</h1>
+    
+    <div id="debug-box">Attente du lancement...<br></div>
+    
+    <button onclick="testerVapi()">1. Tester si Vapi existe</button>
+    <button onclick="lancerAppel()">2. Lancer l'appel (Start)</button>
+
+    <script src="https://cdn.jsdelivr.net/npm/@vapi-ai/web@latest/dist/vapi.browser.js"></script>
+
+    <script>
+        const logBox = document.getElementById('debug-box');
+        
+        function printf(msg) {
+            console.log(msg);
+            logBox.innerHTML += "> " + msg + "<br>";
+            logBox.scrollTop = logBox.scrollHeight;
+        }
+
+        let vapiInstance = null;
+
+        function testerVapi() {
+            printf("Vérification de la bibliothèque...");
+            if (typeof Vapi !== 'undefined') {
+                printf("✅ SUCCÈS : La bibliothèque Vapi est chargée.");
+                try {
+                    vapiInstance = new Vapi('70b97def-d8c0-46e1-9dc0-4a6a4ca11bb5'); // Ta clé
+                    printf("✅ SUCCÈS : Instance créée avec ta clé.");
+                } catch(e) {
+                    printf("❌ ERREUR : Problème avec la clé : " + e.message);
+                }
+            } else {
+                printf("❌ ÉCHEC : Vapi n'est toujours pas défini (bloqué par le client).");
+                alert("Le script est bloqué ! Désactive ton antivirus ou Adblock.");
+            }
+        }
+
+        function lancerAppel() {
+            if (!vapiInstance) {
+                printf("❌ ERREUR : Tu dois d'abord réussir l'étape 1.");
+                return;
+            }
+            printf("Tentative de connexion à l'assistant : 6f7f8c49..."); // Ton ID
+            vapiInstance.start('6f7f8c49-9769-4b3d-8742-0bfa4402e101');
+            
+            vapiInstance.on('call-start', () => printf("🚀 EN LIGNE ! Luigi est là."));
+            vapiInstance.on('error', (e) => printf("❌ ERREUR VAPI : " + e.message));
+        }
+    </script>
+</body>
+</html>
